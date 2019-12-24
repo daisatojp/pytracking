@@ -101,6 +101,7 @@ class ResNet(nn.Module):
         # self.avgpool = nn.AvgPool2d(7, stride=1)
         self.avgpool = nn.AdaptiveAvgPool2d((1,1))
         self.fc = nn.Linear(inplanes*8 * block.expansion, num_classes)
+        self.trace = False
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -154,16 +155,22 @@ class ResNet(nn.Module):
             return outputs
 
         x = self.layer2(x)
+        x2 = x
 
         if self._add_output_and_check('layer2', x, outputs, output_layers):
             return outputs
 
         x = self.layer3(x)
+        x3 = x
+
+        if self.trace:
+            return x2, x3
 
         if self._add_output_and_check('layer3', x, outputs, output_layers):
             return outputs
 
         x = self.layer4(x)
+        x4 = x
 
         if self._add_output_and_check('layer4', x, outputs, output_layers):
             return outputs
