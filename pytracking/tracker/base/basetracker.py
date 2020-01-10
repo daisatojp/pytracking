@@ -49,16 +49,13 @@ class BaseTracker:
                 print('!!! WARNING: Visdom could not start, so using matplotlib visualization instead !!!\n'
                       '!!! Start Visdom in a separate terminal window by typing \'visdom\' !!!')
 
-
     def initialize(self, image, info: dict) -> dict:
         """Overload this function in your tracker. This should initialize the model."""
         raise NotImplementedError
 
-
     def track(self, image) -> dict:
         """Overload this function in your tracker. This should track in the frame and update the model."""
         raise NotImplementedError
-
 
     def track_sequence(self, sequence):
         """Run tracker on a sequence."""
