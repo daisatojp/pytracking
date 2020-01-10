@@ -44,7 +44,7 @@ class DiMP(BaseTracker):
 
         # Set search area
         search_area = torch.prod(self.target_sz * self.params.search_area_scale).item()
-        self.target_scale =  math.sqrt(search_area) / self.img_sample_sz.prod().sqrt()
+        self.target_scale = math.sqrt(search_area) / self.img_sample_sz.prod().sqrt()
 
         # Target size in base scale
         self.base_target_sz = self.target_sz / self.target_scale
@@ -73,15 +73,18 @@ class DiMP(BaseTracker):
         if getattr(self.params, 'use_iou_net', True):
             self.init_iou_net(init_backbone_feat)
 
+        # Distractors
+        self.distractors = []
+
         out = {'time': time.time() - tic}
         return out
-
 
     def track(self, image) -> dict:
         self.debug_info = {}
 
         self.frame_num += 1
         self.debug_info['frame_num'] = self.frame_num
+        inside_ratio = getattr(self.params, 'target_inside_ratio', 0.2)
 
         # Convert image
         im = numpy_to_torch(image)
@@ -89,9 +92,10 @@ class DiMP(BaseTracker):
         # ------- LOCALIZATION ------- #
 
         # Extract backbone features
-        backbone_feat, sample_coords = self.extract_backbone_features(im, self.get_centered_sample_pos(),
-                                                                      self.target_scale * self.params.scale_factors,
-                                                                      self.img_sample_sz)
+        backbone_feat, sample_coords = self.extract_backbone_features(
+            im, self.get_centered_sample_pos(),
+            self.target_scale * self.params.scale_factors, self.img_sample_sz)
+
         # Extract classification features
         test_x = self.get_classification_features(backbone_feat)
 
@@ -100,10 +104,11 @@ class DiMP(BaseTracker):
 
         # Compute classification scores
         scores_raw = self.classify_target(test_x)
+        scoremap = scores_raw[0, 0].cpu().numpy()
 
         # Localize the target
-        translation_vec, scale_ind, s, flag = self.localize_target(scores_raw, sample_scales)
-        new_pos = sample_pos[scale_ind,:] + translation_vec
+        translation_vec, scale_ind, s, flag, max_score, max_disp = self.localize_target(scores_raw, sample_scales)
+        new_pos = sample_pos[scale_ind, :] + translation_vec
 
         self.debug_info['flag'] = flag
 
@@ -113,9 +118,44 @@ class DiMP(BaseTracker):
                 update_scale_flag = getattr(self.params, 'update_scale_when_uncertain', True) or flag != 'uncertain'
                 if getattr(self.params, 'use_classifier', True):
                     self.update_state(new_pos)
-                self.refine_target_box(backbone_feat, sample_pos[scale_ind,:], sample_scales[scale_ind], scale_ind, update_scale_flag)
+                self.refine_target_box(backbone_feat, sample_pos[scale_ind, :], sample_scales[scale_ind], scale_ind, update_scale_flag)
             elif getattr(self.params, 'use_classifier', True):
                 self.update_state(new_pos, sample_scales[scale_ind])
+
+        # update distractors
+        # for distractor in self.distractors:
+        #     pos_1 = distractor['pos']
+        #     target_sz_1 = distractor['target_sz']
+        #     scores_d = self.classify_target_2(distractor['target_filter'], test_x)
+        #     translation_vec, scale_ind, s, flag, max_score, max_disp = self.localize_target(scores_d, sample_scales)
+        #     pos_2 = sample_pos[scale_ind, :] + translation_vec
+        #     inside_offset = (inside_ratio - 0.5) * target_sz_1
+        #     pos_2 = torch.max(torch.min(pos_2, self.image_sz - inside_offset), inside_offset)
+        #     pos_2, target_sz_2 = self.refine_target_box_2(
+        #         backbone_feat, new_pos, self.target_sz,
+        #         sample_pos[scale_ind, :], sample_scales[scale_ind], scale_ind)
+
+        # register distractors
+        distractors = []
+        while 0.1 <= max_score:
+            sz = scores_raw.shape[-2:]
+            d = 1
+            tneigh_top = max(round(max_disp[0].item() - d), 0)
+            tneigh_bottom = min(round(max_disp[0].item() + d + 1), sz[0])
+            tneigh_left = max(round(max_disp[1].item() - d), 0)
+            tneigh_right = min(round(max_disp[1].item() + d + 1), sz[1])
+            scores_raw[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
+            translation_vec, scale_ind, s, flag, max_score, max_disp = self.localize_target(scores_raw, sample_scales, advanced=False)
+            if 0.1 <= max_score:
+                pos_d = sample_pos[scale_ind, :] + translation_vec
+                target_sz_d = self.target_sz
+                inside_offset = (inside_ratio - 0.5) * target_sz_d
+                pos_d = torch.max(torch.min(pos_d, self.image_sz - inside_offset), inside_offset)
+                pos_d, target_sz_d = self.refine_target_box_2(
+                    backbone_feat, pos_d, target_sz_d,
+                    sample_pos[scale_ind, :], sample_scales[scale_ind], scale_ind)
+                new_state = torch.cat((pos_d[[1, 0]] - (target_sz_d[[1, 0]] - 1) / 2, target_sz_d[[1, 0]]))
+                distractors.append(new_state.tolist())
 
         # ------- UPDATE ------- #
 
@@ -128,7 +168,7 @@ class DiMP(BaseTracker):
             train_x = test_x[scale_ind:scale_ind+1, ...]
 
             # Create target_box and label for spatial sample
-            target_box = self.get_iounet_box(self.pos, self.target_sz, sample_pos[scale_ind,:], sample_scales[scale_ind])
+            target_box = self.get_iounet_box(self.pos, self.target_sz, sample_pos[scale_ind, :], sample_scales[scale_ind])
 
             # Update the classifier model
             self.update_classifier(train_x, target_box, learning_rate, s[scale_ind,...])
@@ -150,21 +190,22 @@ class DiMP(BaseTracker):
         # Compute output bounding box
         new_state = torch.cat((self.pos[[1,0]] - (self.target_sz[[1,0]]-1)/2, self.target_sz[[1,0]]))
 
-        out = {'target_bbox': new_state.tolist()}
+        # out = {'target_bbox': new_state.tolist()}
+        out = {'target_bbox': new_state.tolist(), 'distractors': distractors, 'samplecoord': sample_coords[0],
+               'scoremap': scoremap}
         return out
-
 
     def get_sample_location(self, sample_coord):
         """Get the location of the extracted sample."""
         sample_coord = sample_coord.float()
-        sample_pos = 0.5*(sample_coord[:,:2] + sample_coord[:,2:] - 1)
-        sample_scales = ((sample_coord[:,2:] - sample_coord[:,:2]) / self.img_sample_sz).prod(dim=1).sqrt()
+        sample_pos = 0.5*(sample_coord[:, :2] + sample_coord[:, 2:] - 1)
+        sample_scales = ((sample_coord[:, 2:] - sample_coord[:, :2]) / self.img_sample_sz).prod(dim=1).sqrt()
         return sample_pos, sample_scales
 
     def get_centered_sample_pos(self):
         """Get the center position for the new sample. Make sure the target is correctly centered."""
-        return self.pos + ((self.feature_sz + self.kernel_size) % 2) * self.target_scale * \
-               self.img_support_sz / (2*self.feature_sz)
+        return self.pos + ((self.feature_sz + self.kernel_size) % 2)\
+            * self.target_scale * self.img_support_sz / (2 * self.feature_sz)
 
     def classify_target(self, sample_x: TensorList):
         """Classify target by applying the DiMP filter."""
@@ -172,12 +213,18 @@ class DiMP(BaseTracker):
             scores = self.net.classifier.classify(self.target_filter, sample_x)
         return scores
 
-    def localize_target(self, scores, sample_scales):
+    def classify_target_2(self, target_filter, sample_x):
+        """Classify target by applying the DiMP filter."""
+        with torch.no_grad():
+            scores = self.net.classifier.classify(target_filter, sample_x)
+        return scores
+
+    def localize_target(self, scores, sample_scales, advanced=True):
         """Run the target localization."""
 
         scores = scores.squeeze(1)
 
-        if getattr(self.params, 'advanced_localization', False):
+        if getattr(self.params, 'advanced_localization', False) and advanced:
             return self.localize_advanced(scores, sample_scales)
 
         # Get maximum
@@ -191,8 +238,7 @@ class DiMP(BaseTracker):
         # Compute translation vector and scale change factor
         translation_vec = target_disp * (self.img_support_sz / self.feature_sz) * sample_scales[scale_ind]
 
-        return translation_vec, scale_ind, scores, None
-
+        return translation_vec, scale_ind, scores, None, max_score, max_disp
 
     def localize_advanced(self, scores, sample_scales):
         """Run the target advanced localization (as in ATOM)."""
@@ -210,22 +256,23 @@ class DiMP(BaseTracker):
         _, scale_ind = torch.max(max_score1, dim=0)
         sample_scale = sample_scales[scale_ind]
         max_score1 = max_score1[scale_ind]
-        max_disp1 = max_disp1[scale_ind,...].float().cpu().view(-1)
+        max_disp1 = max_disp1[scale_ind, ...].float().cpu().view(-1)
         target_disp1 = max_disp1 - score_center
         translation_vec1 = target_disp1 * (self.img_support_sz / self.feature_sz) * sample_scale
 
         if max_score1.item() < self.params.target_not_found_threshold:
-            return translation_vec1, scale_ind, scores_hn, 'not_found'
+            return translation_vec1, scale_ind, scores_hn, 'not_found', max_score1, max_disp1
 
         # Mask out target neighborhood
-        target_neigh_sz = self.params.target_neighborhood_scale * (self.target_sz / sample_scale) * (self.feature_sz / self.img_support_sz)
+        target_neigh_sz = self.params.target_neighborhood_scale \
+            * (self.target_sz / sample_scale) * (self.feature_sz / self.img_support_sz)
 
         tneigh_top = max(round(max_disp1[0].item() - target_neigh_sz[0].item() / 2), 0)
         tneigh_bottom = min(round(max_disp1[0].item() + target_neigh_sz[0].item() / 2 + 1), sz[0])
         tneigh_left = max(round(max_disp1[1].item() - target_neigh_sz[1].item() / 2), 0)
         tneigh_right = min(round(max_disp1[1].item() + target_neigh_sz[1].item() / 2 + 1), sz[1])
         scores_masked = scores_hn[scale_ind:scale_ind + 1, ...].clone()
-        scores_masked[...,tneigh_top:tneigh_bottom,tneigh_left:tneigh_right] = 0
+        scores_masked[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
 
         # Find new maximum
         max_score2, max_disp2 = dcf.max2d(scores_masked)
@@ -240,19 +287,19 @@ class DiMP(BaseTracker):
             disp_threshold = self.params.dispalcement_scale * math.sqrt(sz[0] * sz[1]) / 2
 
             if disp_norm2 > disp_threshold and disp_norm1 < disp_threshold:
-                return translation_vec1, scale_ind, scores_hn, 'hard_negative'
+                return translation_vec1, scale_ind, scores_hn, 'hard_negative', max_score1, max_disp1
             if disp_norm2 < disp_threshold and disp_norm1 > disp_threshold:
-                return translation_vec2, scale_ind, scores_hn, 'hard_negative'
+                return translation_vec2, scale_ind, scores_hn, 'hard_negative', max_score2, max_disp2
             if disp_norm2 > disp_threshold and disp_norm1 > disp_threshold:
-                return translation_vec1, scale_ind, scores_hn, 'uncertain'
+                return translation_vec1, scale_ind, scores_hn, 'uncertain', max_score1, max_disp1
 
             # If also the distractor is close, return with highest score
-            return translation_vec1, scale_ind, scores_hn, 'uncertain'
+            return translation_vec1, scale_ind, scores_hn, 'uncertain', max_score1, max_disp1
 
         if max_score2 > self.params.hard_negative_threshold * max_score1 and max_score2 > self.params.target_not_found_threshold:
-            return translation_vec1, scale_ind, scores_hn, 'hard_negative'
+            return translation_vec1, scale_ind, scores_hn, 'hard_negative', max_score1, max_disp1
 
-        return translation_vec1, scale_ind, scores_hn, 'normal'
+        return translation_vec1, scale_ind, scores_hn, 'normal', max_score1, max_disp1
 
     def extract_backbone_features(self, im: torch.Tensor, pos: torch.Tensor, scales, sz: torch.Tensor):
         im_patches, patch_coords = sample_patch_multiscale(im, pos, scales, sz, getattr(self.params, 'border_mode', 'replicate'))
@@ -274,7 +321,6 @@ class DiMP(BaseTracker):
     def get_iou_modulation(self, iou_backbone_feat, target_boxes):
         with torch.no_grad():
             return self.net.bb_regressor.get_modulation(iou_backbone_feat, target_boxes)
-
 
     def generate_init_samples(self, im: torch.Tensor) -> TensorList:
         """Perform data augmentation to generate initial training samples."""
@@ -368,25 +414,43 @@ class DiMP(BaseTracker):
             [x.new_zeros(self.params.sample_memory_size, x.shape[1], x.shape[2], x.shape[3]) for x in train_x])
 
         for ts, x in zip(self.training_samples, train_x):
-            ts[:x.shape[0],...] = x
+            ts[:x.shape[0], ...] = x
 
-
-    def update_memory(self, sample_x: TensorList, target_box, learning_rate = None):
+    def update_memory(self, sample_x: TensorList, target_box, learning_rate=None):
         # Update weights and get replace ind
         replace_ind = self.update_sample_weights(self.sample_weights, self.previous_replace_ind, self.num_stored_samples, self.num_init_samples, learning_rate)
         self.previous_replace_ind = replace_ind
 
         # Update sample and label memory
         for train_samp, x, ind in zip(self.training_samples, sample_x, replace_ind):
-            train_samp[ind:ind+1,...] = x
+            train_samp[ind:ind+1, ...] = x
 
         # Update bb memory
         self.target_boxes[replace_ind[0],:] = target_box
 
         self.num_stored_samples += 1
 
+    def update_memory_2(self, sample_x, target_box,
+                        training_samples, sample_weights, previous_replace_ind, target_boxes,
+                        num_stored_samples, num_init_samples, learning_rate=None):
+        # Update weights and get replace ind
+        replace_ind = self.update_sample_weights(
+            sample_weights, previous_replace_ind, num_stored_samples, num_init_samples, learning_rate)
+        previous_replace_ind = replace_ind
 
-    def update_sample_weights(self, sample_weights, previous_replace_ind, num_stored_samples, num_init_samples, learning_rate = None):
+        # Update sample and label memory
+        for train_samp, x, ind in zip(self.training_samples, sample_x, replace_ind):
+            train_samp[ind:ind+1, ...] = x
+
+        # Update bb memory
+        target_boxes[replace_ind[0], :] = target_box
+
+        num_stored_samples += 1
+
+        return training_samples, sample_weights, previous_replace_ind, target_boxes, \
+            num_stored_samples, num_init_samples
+
+    def update_sample_weights(self, sample_weights, previous_replace_ind, num_stored_samples, num_init_samples, learning_rate=None):
         # Update weights and get index to replace
         replace_ind = []
         for sw, prev_ind, num_samp, num_init in zip(sample_weights, previous_replace_ind, num_stored_samples, num_init_samples):
@@ -438,7 +502,6 @@ class DiMP(BaseTracker):
         inside_offset = (inside_ratio - 0.5) * self.target_sz
         self.pos = torch.max(torch.min(new_pos, self.image_sz - inside_offset), inside_offset)
 
-
     def get_iounet_box(self, pos, sz, sample_pos, sample_scale):
         """All inputs in original image coordinates.
         Generates a box in the cropped image sample reference frame, in the format used by the IoUNet."""
@@ -446,7 +509,6 @@ class DiMP(BaseTracker):
         box_sz = sz / sample_scale
         target_ul = box_center - (box_sz - 1) / 2
         return torch.cat([target_ul.flip((0,)), box_sz.flip((0,))])
-
 
     def init_iou_net(self, backbone_feat):
         # Setup IoU net and objective
@@ -474,7 +536,6 @@ class DiMP(BaseTracker):
         # Get modulation vector
         self.iou_modulation = self.get_iou_modulation(iou_backbone_feat, target_boxes)
         self.iou_modulation = TensorList([x.detach().mean(0) for x in self.iou_modulation])
-
 
     def init_classifier(self, init_backbone_feat):
         # Get classification features
@@ -526,7 +587,6 @@ class DiMP(BaseTracker):
             elif self.params.debug >= 3:
                 plot_graph(self.losses, 10, title='Training loss')
 
-
     def update_classifier(self, train_x, target_box, learning_rate=None, scores=None):
         # Set flags and learning rate
         hard_negative_flag = learning_rate is not None
@@ -570,7 +630,7 @@ class DiMP(BaseTracker):
                 elif self.params.debug >= 3:
                     plot_graph(self.losses, 10, title='Training loss')
 
-    def refine_target_box(self, backbone_feat, sample_pos, sample_scale, scale_ind, update_scale = True):
+    def refine_target_box(self, backbone_feat, sample_pos, sample_scale, scale_ind, update_scale=True):
         """Run the ATOM IoUNet to refine the target bounding box."""
 
         # Initial box for refinement
@@ -630,6 +690,57 @@ class DiMP(BaseTracker):
         if update_scale:
             self.target_scale = new_scale
 
+    def refine_target_box_2(self, backbone_feat, pos, target_sz, sample_pos, sample_scale, scale_ind):
+        """Run the ATOM IoUNet to refine the target bounding box."""
+
+        # Initial box for refinement
+        init_box = self.get_iounet_box(pos, target_sz, sample_pos, sample_scale)
+
+        # Extract features from the relevant scale
+        iou_features = self.get_iou_features(backbone_feat)
+        iou_features = TensorList([x[scale_ind:scale_ind+1, ...] for x in iou_features])
+
+        # Generate random initial boxes
+        init_boxes = init_box.view(1,4).clone()
+        if self.params.num_init_random_boxes > 0:
+            square_box_sz = init_box[2:].prod().sqrt()
+            rand_factor = square_box_sz * torch.cat(
+                [self.params.box_jitter_pos * torch.ones(2), self.params.box_jitter_sz * torch.ones(2)])
+            minimal_edge_size = init_box[2:].min()/3
+            rand_bb = (torch.rand(self.params.num_init_random_boxes, 4) - 0.5) * rand_factor
+            new_sz = (init_box[2:] + rand_bb[:, 2:]).clamp(minimal_edge_size)
+            new_center = (init_box[:2] + init_box[2:]/2) + rand_bb[:, :2]
+            init_boxes = torch.cat([new_center - new_sz/2, new_sz], 1)
+            init_boxes = torch.cat([init_box.view(1, 4), init_boxes])
+
+        # Optimize the boxes
+        output_boxes, output_iou = self.optimize_boxes(iou_features, init_boxes)
+
+        # Remove weird boxes
+        output_boxes[:, 2:].clamp_(1)
+        aspect_ratio = output_boxes[:,2] / output_boxes[:,3]
+        keep_ind = (aspect_ratio < self.params.maximal_aspect_ratio) * (aspect_ratio > 1/self.params.maximal_aspect_ratio)
+        output_boxes = output_boxes[keep_ind,:]
+        output_iou = output_iou[keep_ind]
+
+        # If no box found
+        if output_boxes.shape[0] == 0:
+            return None, None
+
+        # Predict box
+        k = getattr(self.params, 'iounet_k', 5)
+        topk = min(k, output_boxes.shape[0])
+        _, inds = torch.topk(output_iou, topk)
+        predicted_box = output_boxes[inds, :].mean(0)
+        predicted_iou = output_iou.view(-1, 1)[inds, :].mean(0)
+
+        # Get new position and size
+        new_pos = predicted_box[:2] + predicted_box[2:] / 2
+        new_pos = (new_pos.flip((0,)) - (self.img_sample_sz - 1) / 2) * sample_scale + sample_pos
+        new_target_sz = predicted_box[2:].flip((0,)) * sample_scale
+        new_scale = torch.sqrt(new_target_sz.prod() / self.base_target_sz.prod())
+
+        return new_pos, new_target_sz
 
     def optimize_boxes(self, iou_features, init_boxes):
         # Optimize iounet boxes

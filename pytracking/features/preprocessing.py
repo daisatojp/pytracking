@@ -106,13 +106,13 @@ def sample_patch(im: torch.Tensor, pos: torch.Tensor, sample_sz: torch.Tensor, o
         br += shift
 
         # Get image patch
-        im_patch = im2[...,tl[0].item():br[0].item(),tl[1].item():br[1].item()]
+        im_patch = im2[..., tl[0].item():br[0].item(), tl[1].item():br[1].item()]
     else:
         # Get image patch
         im_patch = F.pad(im2, (-tl[1].item(), br[1].item() - im2.shape[3], -tl[0].item(), br[0].item() - im2.shape[2]), mode)
 
     # Get image coordinates
-    patch_coord = df * torch.cat((tl, br)).view(1,4)
+    patch_coord = df * torch.cat((tl, br)).view(1, 4)
 
     if output_sz is None or (im_patch.shape[-2] == output_sz[0] and im_patch.shape[-1] == output_sz[1]):
         return im_patch.clone(), patch_coord
