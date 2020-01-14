@@ -11,6 +11,14 @@ from pytracking.features import augmentation
 from pycvlib.math.rectangle import Rectangle
 
 
+def bbox(pos, target_sz, imgw, imgh):
+    x = pos[1] / imgw
+    y = pos[0] / imgh
+    w = target_sz[1] / imgw
+    h = target_sz[0] / imgh
+    return x, y, w, h
+
+
 class DiMP(BaseTracker):
 
     def initialize_features(self):
@@ -37,6 +45,9 @@ class DiMP(BaseTracker):
         state = info['init_bbox']
         self.pos = torch.Tensor([state[1] + (state[3] - 1)/2, state[0] + (state[2] - 1)/2])
         self.target_sz = torch.Tensor([state[3], state[2]])
+
+        self.imgw = image.shape[1]
+        self.imgh = image.shape[0]
 
         # Set sizes
         sz = self.params.image_sample_size
@@ -74,15 +85,26 @@ class DiMP(BaseTracker):
         if getattr(self.params, 'use_iou_net', True):
             self.init_iou_net(init_backbone_feat)
 
-        # Distractors
-        self.distractors = []
+        a_ff = {'start': 1,
+                'end': 2,
+                'pos': self.pos,
+                'target_sz': self.target_sz,
+                'score': 1.0,
+                'target_filter': self.target_filter,
+                'training_samples': self.training_samples,
+                'target_boxes': self.target_boxes,
+                'sample_weights': self.sample_weights,
+                'previous_replace_ind': self.previous_replace_ind,
+                'num_stored_samples': self.num_stored_samples,
+                'num_init_samples': self.num_stored_samples}
+        self.Tracklets = []
+        self.ActiveTracklets = [a_ff]
 
         out = {'time': time.time() - tic}
         return out
 
     def track(self, image) -> dict:
         self.debug_info = {}
-
         self.frame_num += 1
         self.debug_info['frame_num'] = self.frame_num
         inside_ratio = getattr(self.params, 'target_inside_ratio', 0.2)
@@ -104,13 +126,12 @@ class DiMP(BaseTracker):
         sample_pos, sample_scales = self.get_sample_location(sample_coords)
 
         # Compute classification scores
-        scores_raw = self.classify_target(test_x)
+        scores_raw = self.classify_target(self.target_filter, test_x)
         scoremap = scores_raw[0, 0].cpu().numpy()
 
         # Localize the target
         translation_vec, scale_ind, s, flag, max_score, max_disp = self.localize_target(scores_raw, sample_scales)
         new_pos = sample_pos[scale_ind, :] + translation_vec
-
         self.debug_info['flag'] = flag
 
         # Update position and scale
@@ -125,125 +146,147 @@ class DiMP(BaseTracker):
             elif getattr(self.params, 'use_classifier', True):
                 self.update_state(new_pos, sample_scales[scale_ind])
 
-        # update distractors
-        keepidx = []
-        for i, distractor in enumerate(self.distractors):
-            target_sz_d = distractor['target_sz']
-            scores_d = self.classify_target_2(distractor['target_filter'], test_x)
-            translation_vec, scale_ind, s, flag, max_score_d, max_disp_d =\
-                self.localize_target(scores_d, sample_scales)
-            while 0.1 <= max_score_d:
-                pos_d = sample_pos[scale_ind, :] + translation_vec
-                inside_offset = (inside_ratio - 0.5) * target_sz_d
-                pos_d = torch.max(torch.min(pos_d, self.image_sz - inside_offset), inside_offset)
-                pos_d, target_sz_d = self.refine_target_box_2(
-                    backbone_feat, pos_d, target_sz_d,
-                    sample_pos[scale_ind, :], sample_scales[scale_ind], scale_ind)
-                pos_1, target_sz_1 = distractor['pos'], distractor['target_sz']
-                rect_1 = Rectangle(pos_1[0], pos_1[1], target_sz_1[0], target_sz_1[1], 'cy_cx_h_w')
-                rect_2 = Rectangle(pos_d[0], pos_d[1], target_sz_d[0], target_sz_d[1], 'cy_cx_h_w')
-                rect_t = Rectangle(self.pos[0], self.pos[1], self.target_sz[0], self.target_sz[1], 'cy_cx_h_w')
-                if 0.5 <= Rectangle.iou(rect_1, rect_2) and Rectangle.iou(rect_2, rect_t) < 0.4:
-                    keepidx.append(i)
-                    target_filter = distractor['target_filter']
-                    training_samples = distractor['training_samples']
-                    target_boxes = distractor['target_boxes']
-                    sample_weights = distractor['sample_weights']
-                    previous_replace_ind = distractor['previous_replace_ind']
-                    num_stored_samples = distractor['num_stored_samples']
-                    num_init_samples = distractor['num_init_samples']
-                    train_x = test_x[scale_ind:scale_ind + 1, ...]
-                    target_box = self.get_iounet_box(
-                        pos_d, target_sz_d, sample_pos[scale_ind, :], sample_scales[scale_ind])
-                    target_filter, training_samples, target_boxes, sample_weights, \
-                        previous_replace_ind, num_stored_samples, num_init_samples \
-                        = self.update_classifier_for_distractor(
-                            train_x, target_box, target_filter,
-                            training_samples, target_boxes, sample_weights,
-                            previous_replace_ind, num_stored_samples, num_init_samples)
-                    distractor['pos'] = pos_d
-                    distractor['target_sz'] = target_sz_d
-                    distractor['target_filter'] = target_filter
-                    distractor['training_samples'] = training_samples
-                    distractor['target_boxes'] = target_boxes
-                    distractor['sample_weights'] = sample_weights
-                    distractor['previous_replace_ind'] = previous_replace_ind
-                    distractor['num_stored_samples'] = num_stored_samples
-                    distractor['num_init_samples'] = num_init_samples
-                    break
-                else:
-                    sz = scores_d.shape[-2:]
-                    d = 1
-                    tneigh_top = max(round(max_disp_d[0].item() - d), 0)
-                    tneigh_bottom = min(round(max_disp_d[0].item() + d + 1), sz[0])
-                    tneigh_left = max(round(max_disp_d[1].item() - d), 0)
-                    tneigh_right = min(round(max_disp_d[1].item() + d + 1), sz[1])
-                    scores_d[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
-                    translation_vec, scale_ind, s, flag, max_score_d, max_disp_d \
-                        = self.localize_target(scores_d, sample_scales)
+        self.ActiveTracklets = [{
+            'start': self.frame_num,
+            'end': self.frame_num + 1,
+            'pos': self.pos,
+            'target_sz': self.target_sz,
+            'score': 1.0,
+            'target_filter': self.target_filter,
+            'training_samples': self.training_samples,
+            'target_boxes': self.target_boxes,
+            'sample_weights': self.sample_weights,
+            'previous_replace_ind': self.previous_replace_ind,
+            'num_stored_samples': self.num_stored_samples,
+            'num_init_samples': self.num_stored_samples}]
+
+        candidates_tracklets = []
+        if 2 <= self.frame_num:
+            candidates_tracklets = self.find_candidates(
+                2, backbone_feat, self.target_filter, test_x,
+                sample_pos, sample_scales, self.target_sz,
+                self.training_samples, self.target_boxes, self.sample_weights,
+                self.previous_replace_ind, self.num_stored_samples, self.num_init_samples)
+
+        # # update distractors
+        # keepidx = []
+        # for i, distractor in enumerate(self.distractors):
+        #     target_sz_d = distractor['target_sz']
+        #     scores_d = self.classify_target_2(distractor['target_filter'], test_x)
+        #     translation_vec, scale_ind, s, flag, max_score_d, max_disp_d =\
+        #         self.localize_target(scores_d, sample_scales)
+        #     while 0.1 <= max_score_d:
+        #         pos_d = sample_pos[scale_ind, :] + translation_vec
+        #         inside_offset = (inside_ratio - 0.5) * target_sz_d
+        #         pos_d = torch.max(torch.min(pos_d, self.image_sz - inside_offset), inside_offset)
+        #         pos_d, target_sz_d = self.refine_target_box_2(
+        #             backbone_feat, pos_d, target_sz_d,
+        #             sample_pos[scale_ind, :], sample_scales[scale_ind], scale_ind)
+        #         pos_1, target_sz_1 = distractor['pos'], distractor['target_sz']
+        #         rect_1 = Rectangle(pos_1[0], pos_1[1], target_sz_1[0], target_sz_1[1], 'cy_cx_h_w')
+        #         rect_2 = Rectangle(pos_d[0], pos_d[1], target_sz_d[0], target_sz_d[1], 'cy_cx_h_w')
+        #         rect_t = Rectangle(self.pos[0], self.pos[1], self.target_sz[0], self.target_sz[1], 'cy_cx_h_w')
+        #         if 0.5 <= Rectangle.iou(rect_1, rect_2) and Rectangle.iou(rect_2, rect_t) < 0.4:
+        #             keepidx.append(i)
+        #             target_filter = distractor['target_filter']
+        #             training_samples = distractor['training_samples']
+        #             target_boxes = distractor['target_boxes']
+        #             sample_weights = distractor['sample_weights']
+        #             previous_replace_ind = distractor['previous_replace_ind']
+        #             num_stored_samples = distractor['num_stored_samples']
+        #             num_init_samples = distractor['num_init_samples']
+        #             train_x = test_x[scale_ind:scale_ind + 1, ...]
+        #             target_box = self.get_iounet_box(
+        #                 pos_d, target_sz_d, sample_pos[scale_ind, :], sample_scales[scale_ind])
+        #             target_filter, training_samples, target_boxes, sample_weights, \
+        #                 previous_replace_ind, num_stored_samples, num_init_samples \
+        #                 = self.update_classifier_for_distractor(
+        #                     train_x, target_box, target_filter,
+        #                     training_samples, target_boxes, sample_weights,
+        #                     previous_replace_ind, num_stored_samples, num_init_samples)
+        #             distractor['pos'] = pos_d
+        #             distractor['target_sz'] = target_sz_d
+        #             distractor['target_filter'] = target_filter
+        #             distractor['training_samples'] = training_samples
+        #             distractor['target_boxes'] = target_boxes
+        #             distractor['sample_weights'] = sample_weights
+        #             distractor['previous_replace_ind'] = previous_replace_ind
+        #             distractor['num_stored_samples'] = num_stored_samples
+        #             distractor['num_init_samples'] = num_init_samples
+        #             break
+        #         else:
+        #             sz = scores_d.shape[-2:]
+        #             d = 1
+        #             tneigh_top = max(round(max_disp_d[0].item() - d), 0)
+        #             tneigh_bottom = min(round(max_disp_d[0].item() + d + 1), sz[0])
+        #             tneigh_left = max(round(max_disp_d[1].item() - d), 0)
+        #             tneigh_right = min(round(max_disp_d[1].item() + d + 1), sz[1])
+        #             scores_d[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
+        #             translation_vec, scale_ind, s, flag, max_score_d, max_disp_d \
+        #                 = self.localize_target(scores_d, sample_scales)
 
         # keep distractors
-        self.distractors = [self.distractors[i] for i in keepidx]
+        # self.distractors = [self.distractors[i] for i in keepidx]
 
         # register distractors
-        while 0.1 <= max_score:
-            sz = scores_raw.shape[-2:]
-            d = 1
-            tneigh_top = max(round(max_disp[0].item() - d), 0)
-            tneigh_bottom = min(round(max_disp[0].item() + d + 1), sz[0])
-            tneigh_left = max(round(max_disp[1].item() - d), 0)
-            tneigh_right = min(round(max_disp[1].item() + d + 1), sz[1])
-            scores_raw[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
-            translation_vec, scale_ind, s, flag, max_score, max_disp \
-                = self.localize_target(scores_raw, sample_scales, advanced=False)
-            if 0.1 <= max_score:
-                pos_d = sample_pos[scale_ind, :] + translation_vec
-                target_sz_d = self.target_sz
-                inside_offset = (inside_ratio - 0.5) * target_sz_d
-                pos_d = torch.max(torch.min(pos_d, self.image_sz - inside_offset), inside_offset)
-                pos_d, target_sz_d = self.refine_target_box_2(
-                    backbone_feat, pos_d, target_sz_d,
-                    sample_pos[scale_ind, :], sample_scales[scale_ind], scale_ind)
-                rect_t = Rectangle(
-                    float(self.pos[0]), float(self.pos[1]),
-                    float(self.target_sz[0]), float(self.target_sz[1]), 'cy_cx_h_w')
-                rect_1 = Rectangle(
-                    float(pos_d[0]), float(pos_d[1]),
-                    float(target_sz_d[0]), float(target_sz_d[1]), 'cy_cx_h_w')
-                maxiou = Rectangle.iou(rect_t, rect_1)
-                for distractor in self.distractors:
-                    rect_2 = Rectangle(
-                        float(distractor['pos'][0]), float(distractor['pos'][1]),
-                        float(distractor['target_sz'][0]), float(distractor['target_sz'][0]), 'cy_cx_h_w')
-                    iou = Rectangle.iou(rect_1, rect_2)
-                    if maxiou < iou:
-                        maxiou = iou
-                if maxiou < 0.2:
-                    target_filter = self.target_filter.clone()
-                    training_samples = self.training_samples.copy()
-                    target_boxes = self.target_boxes.clone()
-                    sample_weights = self.sample_weights.copy()
-                    previous_replace_ind = self.previous_replace_ind.copy()
-                    num_stored_samples = self.num_stored_samples.copy()
-                    num_init_samples = self.num_init_samples.copy()
-                    train_x = test_x[scale_ind:scale_ind + 1, ...]
-                    target_box = self.get_iounet_box(
-                        pos_d, target_sz_d, sample_pos[scale_ind, :], sample_scales[scale_ind])
-                    target_filter, training_samples, target_boxes, sample_weights, \
-                        previous_replace_ind, num_stored_samples, num_init_samples \
-                        = self.update_classifier_for_distractor(
-                            train_x, target_box, target_filter,
-                            training_samples, target_boxes, sample_weights,
-                            previous_replace_ind, num_stored_samples, num_init_samples)
-                    self.distractors.append({
-                        'pos': pos_d, 'target_sz': target_sz_d,
-                        'target_filter': target_filter,
-                        'training_samples': training_samples,
-                        'target_boxes': target_boxes,
-                        'sample_weights': sample_weights,
-                        'previous_replace_ind': previous_replace_ind,
-                        'num_stored_samples': num_stored_samples,
-                        'num_init_samples': num_init_samples})
+        # while 0.1 <= max_score:
+        #     sz = scores_raw.shape[-2:]
+        #     d = 1
+        #     tneigh_top = max(round(max_disp[0].item() - d), 0)
+        #     tneigh_bottom = min(round(max_disp[0].item() + d + 1), sz[0])
+        #     tneigh_left = max(round(max_disp[1].item() - d), 0)
+        #     tneigh_right = min(round(max_disp[1].item() + d + 1), sz[1])
+        #     scores_raw[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
+        #     translation_vec, scale_ind, s, flag, max_score, max_disp \
+        #         = self.localize_target(scores_raw, sample_scales, advanced=False)
+        #     if 0.1 <= max_score:
+        #         pos_d = sample_pos[scale_ind, :] + translation_vec
+        #         target_sz_d = self.target_sz
+        #         inside_offset = (inside_ratio - 0.5) * target_sz_d
+        #         pos_d = torch.max(torch.min(pos_d, self.image_sz - inside_offset), inside_offset)
+        #         pos_d, target_sz_d = self.refine_target_box_2(
+        #             backbone_feat, pos_d, target_sz_d,
+        #             sample_pos[scale_ind, :], sample_scales[scale_ind], scale_ind)
+        #         rect_t = Rectangle(
+        #             float(self.pos[0]), float(self.pos[1]),
+        #             float(self.target_sz[0]), float(self.target_sz[1]), 'cy_cx_h_w')
+        #         rect_1 = Rectangle(
+        #             float(pos_d[0]), float(pos_d[1]),
+        #             float(target_sz_d[0]), float(target_sz_d[1]), 'cy_cx_h_w')
+        #         maxiou = Rectangle.iou(rect_t, rect_1)
+        #         for distractor in self.distractors:
+        #             rect_2 = Rectangle(
+        #                 float(distractor['pos'][0]), float(distractor['pos'][1]),
+        #                 float(distractor['target_sz'][0]), float(distractor['target_sz'][0]), 'cy_cx_h_w')
+        #             iou = Rectangle.iou(rect_1, rect_2)
+        #             if maxiou < iou:
+        #                 maxiou = iou
+        #         if maxiou < 0.2:
+        #             target_filter = self.target_filter.clone()
+        #             training_samples = self.training_samples.copy()
+        #             target_boxes = self.target_boxes.clone()
+        #             sample_weights = self.sample_weights.copy()
+        #             previous_replace_ind = self.previous_replace_ind.copy()
+        #             num_stored_samples = self.num_stored_samples.copy()
+        #             num_init_samples = self.num_init_samples.copy()
+        #             train_x = test_x[scale_ind:scale_ind + 1, ...]
+        #             target_box = self.get_iounet_box(
+        #                 pos_d, target_sz_d, sample_pos[scale_ind, :], sample_scales[scale_ind])
+        #             target_filter, training_samples, target_boxes, sample_weights, \
+        #                 previous_replace_ind, num_stored_samples, num_init_samples \
+        #                 = self.update_classifier_for_distractor(
+        #                     train_x, target_box, target_filter,
+        #                     training_samples, target_boxes, sample_weights,
+        #                     previous_replace_ind, num_stored_samples, num_init_samples)
+        #             self.distractors.append({
+        #                 'pos': pos_d, 'target_sz': target_sz_d,
+        #                 'target_filter': target_filter,
+        #                 'training_samples': training_samples,
+        #                 'target_boxes': target_boxes,
+        #                 'sample_weights': sample_weights,
+        #                 'previous_replace_ind': previous_replace_ind,
+        #                 'num_stored_samples': num_stored_samples,
+        #                 'num_init_samples': num_init_samples})
 
         # ------- UPDATE ------- #
 
@@ -274,16 +317,22 @@ class DiMP(BaseTracker):
         elif self.params.debug >= 2:
             show_tensor(score_map, 5, title='Max score = {:.2f}'.format(max_score))
 
-        # out = {'target_bbox': new_state.tolist()}
-        # Compute output bounding box
         new_state = torch.cat((self.pos[[1, 0]] - (self.target_sz[[1, 0]] - 1) / 2, self.target_sz[[1, 0]]))
-        distractors = []
-        for distractor in self.distractors:
-            pos_d, target_sz_d = distractor['pos'], distractor['target_sz']
-            state_d = torch.cat((pos_d[[1, 0]] - (target_sz_d[[1, 0]] - 1) / 2, target_sz_d[[1, 0]]))
-            distractors.append(state_d.tolist())
-        out = {'target_bbox': new_state.tolist(), 'distractors': distractors,
-               'samplecoord': sample_coords[0], 'scoremap': scoremap}
+        candidates = []
+        for candidate in candidates_tracklets:
+            pos_c, target_sz_c = candidate['pos'], candidate['target_sz']
+            state_c = torch.cat((pos_c[[1, 0]] - (target_sz_c[[1, 0]] - 1) / 2, target_sz_c[[1, 0]]))
+            candidates.append(state_c.tolist())
+        out = {'target_bbox': new_state.tolist(), 'candidates': candidates}
+        # Compute output bounding box
+        # new_state = torch.cat((self.pos[[1, 0]] - (self.target_sz[[1, 0]] - 1) / 2, self.target_sz[[1, 0]]))
+        # distractors = []
+        # for distractor in self.distractors:
+        #     pos_d, target_sz_d = distractor['pos'], distractor['target_sz']
+        #     state_d = torch.cat((pos_d[[1, 0]] - (target_sz_d[[1, 0]] - 1) / 2, target_sz_d[[1, 0]]))
+        #     distractors.append(state_d.tolist())
+        # out = {'target_bbox': new_state.tolist(), 'distractors': distractors,
+        #        'samplecoord': sample_coords[0], 'scoremap': scoremap}
         return out
 
     def get_sample_location(self, sample_coord):
@@ -298,13 +347,7 @@ class DiMP(BaseTracker):
         return self.pos + ((self.feature_sz + self.kernel_size) % 2)\
             * self.target_scale * self.img_support_sz / (2 * self.feature_sz)
 
-    def classify_target(self, sample_x: TensorList):
-        """Classify target by applying the DiMP filter."""
-        with torch.no_grad():
-            scores = self.net.classifier.classify(self.target_filter, sample_x)
-        return scores
-
-    def classify_target_2(self, target_filter, sample_x):
+    def classify_target(self, target_filter, sample_x: TensorList):
         """Classify target by applying the DiMP filter."""
         with torch.no_grad():
             scores = self.net.classifier.classify(target_filter, sample_x)
@@ -312,12 +355,9 @@ class DiMP(BaseTracker):
 
     def localize_target(self, scores, sample_scales, advanced=True):
         """Run the target localization."""
-
         scores = scores.squeeze(1)
-
         if getattr(self.params, 'advanced_localization', False) and advanced:
             return self.localize_advanced(scores, sample_scales)
-
         # Get maximum
         score_sz = torch.Tensor(list(scores.shape[-2:]))
         score_center = (score_sz - 1)/2
@@ -325,10 +365,9 @@ class DiMP(BaseTracker):
         _, scale_ind = torch.max(max_score, dim=0)
         max_disp = max_disp[scale_ind,...].float().cpu().view(-1)
         target_disp = max_disp - score_center
-
         # Compute translation vector and scale change factor
-        translation_vec = target_disp * (self.img_support_sz / self.feature_sz) * sample_scales[scale_ind]
-
+        translation_vec = \
+            target_disp * (self.img_support_sz / self.feature_sz) * sample_scales[scale_ind]
         return translation_vec, scale_ind, scores, None, max_score, max_disp
 
     def localize_advanced(self, scores, sample_scales):
@@ -521,9 +560,10 @@ class DiMP(BaseTracker):
 
         self.num_stored_samples += 1
 
-    def update_memory_2(self, sample_x, target_box,
-                        training_samples, target_boxes, sample_weights,
-                        previous_replace_ind, num_stored_samples, num_init_samples, learning_rate=None):
+    def update_memory_individually(
+            self, sample_x, target_box,
+            training_samples, target_boxes, sample_weights,
+            previous_replace_ind, num_stored_samples, num_init_samples, learning_rate=None):
         # Update weights and get replace ind
         replace_ind = self.update_sample_weights(
             sample_weights, previous_replace_ind,
@@ -722,13 +762,16 @@ class DiMP(BaseTracker):
                 elif self.params.debug >= 3:
                     plot_graph(self.losses, 10, title='Training loss')
 
-    def update_classifier_for_distractor(
-            self, train_x, target_box, target_filter, training_samples, target_boxes, sample_weights,
+    def update_classifier_individually(
+            self, train_x, target_box, target_filter,
+            training_samples, target_boxes, sample_weights,
             previous_replace_ind, num_stored_samples, num_init_samples):
         # Update the tracker memory
-        training_samples, target_boxes, sample_weights, previous_replace_ind, num_stored_samples, num_init_samples = \
-            self.update_memory_2(
-                TensorList([train_x]), target_box, training_samples, target_boxes, sample_weights,
+        training_samples, target_boxes, sample_weights, \
+            previous_replace_ind, num_stored_samples, num_init_samples \
+            = self.update_memory_individually(
+                TensorList([train_x]), target_box,
+                training_samples, target_boxes, sample_weights,
                 previous_replace_ind, num_stored_samples, num_init_samples,
                 self.params.learning_rate)
 
@@ -810,7 +853,9 @@ class DiMP(BaseTracker):
         if update_scale:
             self.target_scale = new_scale
 
-    def refine_target_box_2(self, backbone_feat, pos, target_sz, sample_pos, sample_scale, scale_ind):
+    def refine_target_box_individually(
+            self, backbone_feat, pos, target_sz,
+            sample_pos, sample_scale, scale_ind):
         """Run the ATOM IoUNet to refine the target bounding box."""
 
         # Initial box for refinement
@@ -869,6 +914,7 @@ class DiMP(BaseTracker):
         if isinstance(step_length, (tuple, list)):
             step_length = torch.Tensor([step_length[0], step_length[0], step_length[1], step_length[1]], device=self.params.device).view(1,1,4)
 
+        outputs = None
         for i_ in range(self.params.box_refinement_iter):
             # forward pass
             bb_init = output_boxes.clone().detach()
@@ -887,4 +933,73 @@ class DiMP(BaseTracker):
 
             step_length *= self.params.box_refinement_step_decay
 
-        return output_boxes.view(-1,4).cpu(), outputs.detach().view(-1).cpu()
+        return output_boxes.view(-1, 4).cpu(), outputs.detach().view(-1).cpu()
+
+    def find_candidates(
+            self, frame_num, backbone_feat, target_filter, sample_x,
+            sample_poss, sample_scales, target_sz,
+            training_samples, target_boxes, sample_weights,
+            previous_replace_ind, num_stored_samples, num_init_samples):
+        candidates_tracklets = []
+        inside_ratio = getattr(self.params, 'target_inside_ratio', 0.2)
+        inside_offset = (inside_ratio - 0.5) * target_sz
+        scoremap = self.classify_target(target_filter, sample_x)
+        while True:
+            translation_vec, scale_ind, s, flag, scoremax, dispmax =\
+                self.localize_target(scoremap, sample_scales, advanced=False)
+            if 0.1 <= scoremax:
+                pos = sample_poss[scale_ind, :] + translation_vec
+                pos = torch.max(torch.min(pos, self.image_sz - inside_offset), inside_offset)
+                pos, target_sz = self.refine_target_box_individually(
+                    backbone_feat, pos, target_sz,
+                    sample_poss[scale_ind, :], sample_scales[scale_ind], scale_ind)
+                rect_t = Rectangle(
+                    float(pos[0]), float(pos[1]),
+                    float(target_sz[0]), float(target_sz[1]), 'cy_cx_h_w')
+                maxiou = 0.0
+                for tracklet in self.ActiveTracklets:
+                    rect_i = Rectangle(
+                        float(tracklet['pos'][0]), float(tracklet['pos'][1]),
+                        float(tracklet['target_sz'][0]), float(tracklet['target_sz'][1]), 'cy_cx_h_w')
+                    iou = Rectangle.iou(rect_t, rect_i)
+                    maxiou = max(maxiou, iou)
+                if maxiou < 0.2:
+                    train_x = sample_x[scale_ind:scale_ind + 1, ...]
+                    target_box = self.get_iounet_box(
+                        pos, target_sz, sample_poss[scale_ind, :], sample_scales[scale_ind])
+                    target_filter = target_filter.clone()
+                    training_samples = training_samples.copy()
+                    target_boxes = target_boxes.clone()
+                    sample_weights = sample_weights.copy()
+                    previous_replace_ind = previous_replace_ind.copy()
+                    num_stored_samples = num_stored_samples.copy()
+                    num_init_samples = num_init_samples.copy()
+                    target_filter, training_samples, target_boxes, sample_weights, \
+                        previous_replace_ind, num_stored_samples, num_init_samples \
+                        = self.update_classifier_individually(
+                            train_x, target_box, target_filter,
+                            training_samples, target_boxes, sample_weights,
+                            previous_replace_ind, num_stored_samples, num_init_samples)
+                    candidates_tracklets.append({
+                        'start': frame_num,
+                        'end': frame_num + 1,
+                        'pos': pos,
+                        'target_sz': target_sz,
+                        'score': scoremax,
+                        'target_filter': target_filter,
+                        'training_samples': training_samples,
+                        'target_boxes': target_boxes,
+                        'sample_weights': sample_weights,
+                        'previous_replace_ind': previous_replace_ind,
+                        'num_stored_samples': num_stored_samples,
+                        'num_init_samples': num_init_samples})
+                sz = scoremap.shape[-2:]
+                d = 1
+                tneigh_top = max(round(dispmax[0].item() - d), 0)
+                tneigh_bottom = min(round(dispmax[0].item() + d + 1), sz[0])
+                tneigh_left = max(round(dispmax[1].item() - d), 0)
+                tneigh_right = min(round(dispmax[1].item() + d + 1), sz[1])
+                scoremap[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
+            else:
+                break
+        return candidates_tracklets
