@@ -28,30 +28,28 @@ def test(tracker_, src_dir, out_dir):
     img = cv2.imread(img_path0)
     imgw = img[1]
     imgh = img[0]
-    tracker_.initialize(img, {'init_bbox': init_bbox})
+    tracker_.initialize(img, {'init_bbox': init_bbox}, join(out_dir, 'log.txt'))
     frame_disp = img.copy()
     cv2.rectangle(
         frame_disp, (int(xmin), int(ymin)), (int(xmax), int(ymax)), (0, 255, 0), 5)
-    cv2.imwrite(join(out_dir, 'frame{0:04d}.jpg'.format(0)), frame_disp)
+    cv2.imwrite(join(out_dir, 'frame{0:04d}.jpg'.format(tracker_.frame_num)), frame_disp)
 
     for i in range(1, len(img_paths)):
         img_path = img_paths[i]
         frame = cv2.imread(img_path)
         frame_disp = frame.copy()
         out = tracker_.track(frame)
-        state = [int(s) for s in out['target_bbox']]
-        cv2.rectangle(
-            frame_disp, (state[0], state[1]), (state[2] + state[0], state[3] + state[1]),
-            (0, 255, 0), 5)
-        # coord = [int(s) for s in out['samplecoord']]
-        # cv2.rectangle(
-        #     frame_disp, (coord[1], coord[0]), (coord[3], coord[2]), (255, 0, 0), 5)
-        for candidate in out['candidates']:
-            state = [int(s) for s in candidate]
+        for at in out['ats']:
+            state = [int(s) for s in at]
             cv2.rectangle(
                 frame_disp, (state[0], state[1]), (state[2] + state[0], state[3] + state[1]),
                 (0, 0, 255), 5)
-        cv2.imwrite(join(out_dir, 'frame{0:04d}.jpg'.format(i)), frame_disp)
+        state = [int(s) for s in out['att']]
+        cv2.rectangle(
+            frame_disp, (state[0], state[1]), (state[2] + state[0], state[3] + state[1]),
+            (0, 255, 0), 5)
+        cv2.imwrite(join(out_dir, 'frame{0:04d}.jpg'.format(tracker_.frame_num)), frame_disp)
+        print('write frame {}'.format(tracker_.frame_num))
 
         # scoremap = out['scoremap']
         # fig, ax = plt.subplots()

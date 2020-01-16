@@ -28,7 +28,6 @@ class Tracker:
         tracker_module = importlib.import_module('pytracking.tracker.{}'.format(self.name))
         self.tracker_class = tracker_module.get_tracker_class()
 
-
     def run(self, seq, visualization=None, debug=None, visdom_info=None):
         """Run tracker on sequence.
         args:

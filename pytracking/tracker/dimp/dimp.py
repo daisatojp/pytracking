@@ -1,14 +1,17 @@
 from pytracking.tracker.base import BaseTracker
+import numpy as np
 import torch
 import torch.nn.functional as F
 import math
 import time
+from itertools import combinations
 from pytracking import dcf, TensorList
 from pytracking.features.preprocessing import numpy_to_torch
 from pytracking.utils.plotting import show_tensor, plot_graph
 from pytracking.features.preprocessing import sample_patch_multiscale, sample_patch_transformed
 from pytracking.features import augmentation
 from pycvlib.math.rectangle import Rectangle
+from pycvlib.utility.log import Log
 
 
 def bbox(pos, target_sz, imgw, imgh):
@@ -19,6 +22,21 @@ def bbox(pos, target_sz, imgw, imgh):
     return x, y, w, h
 
 
+def tracklet_str(tracklet):
+    return 'len={}, start={}, end={}, pos=[{:0.1f},{:0.1f}], target_sz=[{:0.1f},{:0.1f}], '\
+           'score={:0.4f}, iou={:0.4f}, dpscore={:0.3f}'.format(
+                len(tracklet['pos']),
+                tracklet['start_frame'],
+                tracklet['end_frame'],
+                float(tracklet['pos'][-1][0]),
+                float(tracklet['pos'][-1][1]),
+                float(tracklet['target_sz'][-1][0]),
+                float(tracklet['target_sz'][-1][1]),
+                float(tracklet['score'][-1]),
+                float(tracklet['iou'][-1]),
+                float(tracklet['dpscore']))
+
+
 class DiMP(BaseTracker):
 
     def initialize_features(self):
@@ -26,7 +44,7 @@ class DiMP(BaseTracker):
             self.params.net.initialize()
         self.features_initialized = True
 
-    def initialize(self, image, info: dict) -> dict:
+    def initialize(self, image, info: dict, logpath='log.txt') -> dict:
         # Initialize some stuff
         self.frame_num = 1
         if not hasattr(self.params, 'device'):
@@ -85,20 +103,34 @@ class DiMP(BaseTracker):
         if getattr(self.params, 'use_iou_net', True):
             self.init_iou_net(init_backbone_feat)
 
-        a_ff = {'start': 1,
-                'end': 2,
-                'pos': self.pos,
-                'target_sz': self.target_sz,
-                'score': 1.0,
-                'target_filter': self.target_filter,
-                'training_samples': self.training_samples,
-                'target_boxes': self.target_boxes,
-                'sample_weights': self.sample_weights,
-                'previous_replace_ind': self.previous_replace_ind,
-                'num_stored_samples': self.num_stored_samples,
-                'num_init_samples': self.num_stored_samples}
-        self.Tracklets = []
-        self.ActiveTracklets = [a_ff]
+        # log
+        self.log = Log(logpath, output=True)
+
+        self.wloc = 1.0
+        aff = {
+            'start_frame': 1,
+            'end_frame': 2,
+            'pos': [self.pos],
+            'target_sz': [self.target_sz],
+            'score': [1.0],
+            'iou': [1.0],
+            'dpscore': 0.0,
+            'target_filter': self.target_filter,
+            'training_samples': self.training_samples,
+            'target_boxes': self.target_boxes,
+            'sample_weights': self.sample_weights,
+            'previous_replace_ind': self.previous_replace_ind,
+            'num_stored_samples': self.num_stored_samples,
+            'num_init_samples': self.num_stored_samples}
+        self.Tracklets = [aff]
+        self.ActiveTracklets = []
+        self.att = aff
+
+        self.log('frame={}'.format(self.frame_num))
+        self.log('')
+        self.log('att : {}'.format(tracklet_str(self.att)))
+        self.log('')
+        self.log.flush()
 
         out = {'time': time.time() - tic}
         return out
@@ -107,7 +139,7 @@ class DiMP(BaseTracker):
         self.debug_info = {}
         self.frame_num += 1
         self.debug_info['frame_num'] = self.frame_num
-        inside_ratio = getattr(self.params, 'target_inside_ratio', 0.2)
+        # inside_ratio = getattr(self.params, 'target_inside_ratio', 0.2)
 
         # Convert image
         im = numpy_to_torch(image)
@@ -120,53 +152,153 @@ class DiMP(BaseTracker):
             self.target_scale * self.params.scale_factors, self.img_sample_sz)
 
         # Extract classification features
-        test_x = self.get_classification_features(backbone_feat)
+        sample_x = self.get_classification_features(backbone_feat)
 
         # Location of sample
-        sample_pos, sample_scales = self.get_sample_location(sample_coords)
+        sample_poss, sample_scales = self.get_sample_location(sample_coords)
 
         # Compute classification scores
-        scores_raw = self.classify_target(self.target_filter, test_x)
-        scoremap = scores_raw[0, 0].cpu().numpy()
+        # scores_raw = self.classify_target(self.target_filter, test_x)
+        # scoremap = scores_raw[0, 0].cpu().numpy()
 
         # Localize the target
-        translation_vec, scale_ind, s, flag, max_score, max_disp = self.localize_target(scores_raw, sample_scales)
-        new_pos = sample_pos[scale_ind, :] + translation_vec
-        self.debug_info['flag'] = flag
+        # translation_vec, scale_ind, s, flag, max_score, max_disp = self.localize_target(scores_raw, sample_scales)
+        # new_pos = sample_pos[scale_ind, :] + translation_vec
+        # self.debug_info['flag'] = flag
+
+        scoremap_att = self.classify_target(self.att['target_filter'], sample_x)
 
         # Update position and scale
-        if flag != 'not_found':
-            if getattr(self.params, 'use_iou_net', True):
-                update_scale_flag = getattr(self.params, 'update_scale_when_uncertain', True) or flag != 'uncertain'
-                if getattr(self.params, 'use_classifier', True):
-                    self.update_state(new_pos)
-                self.refine_target_box(
-                    backbone_feat, sample_pos[scale_ind, :], sample_scales[scale_ind],
-                    scale_ind, update_scale_flag)
-            elif getattr(self.params, 'use_classifier', True):
-                self.update_state(new_pos, sample_scales[scale_ind])
+        # if flag != 'not_found':
+        #     if getattr(self.params, 'use_iou_net', True):
+        #         update_scale_flag = getattr(self.params, 'update_scale_when_uncertain', True) or flag != 'uncertain'
+        #         if getattr(self.params, 'use_classifier', True):
+        #             self.update_state(new_pos)
+        #         self.refine_target_box(
+        #             backbone_feat, sample_pos[scale_ind, :], sample_scales[scale_ind],
+        #             scale_ind, update_scale_flag)
+        #     elif getattr(self.params, 'use_classifier', True):
+        #         self.update_state(new_pos, sample_scales[scale_ind])
 
-        self.ActiveTracklets = [{
-            'start': self.frame_num,
-            'end': self.frame_num + 1,
-            'pos': self.pos,
-            'target_sz': self.target_sz,
-            'score': 1.0,
-            'target_filter': self.target_filter,
-            'training_samples': self.training_samples,
-            'target_boxes': self.target_boxes,
-            'sample_weights': self.sample_weights,
-            'previous_replace_ind': self.previous_replace_ind,
-            'num_stored_samples': self.num_stored_samples,
-            'num_init_samples': self.num_stored_samples}]
+        # self.ActiveTracklets = [{
+        #     'start_frame': self.frame_num,
+        #     'end_frame': self.frame_num + 1,
+        #     'start_pos': self.pos,
+        #     'start_target_sz': self.target_sz,
+        #     'score': [1.0],
+        #     'target_filter': self.target_filter,
+        #     'training_samples': self.training_samples,
+        #     'target_boxes': self.target_boxes,
+        #     'sample_weights': self.sample_weights,
+        #     'previous_replace_ind': self.previous_replace_ind,
+        #     'num_stored_samples': self.num_stored_samples,
+        #     'num_init_samples': self.num_stored_samples}]
 
-        candidates_tracklets = []
-        if 2 <= self.frame_num:
-            candidates_tracklets = self.find_candidates(
-                2, backbone_feat, self.target_filter, test_x,
-                sample_pos, sample_scales, self.target_sz,
-                self.training_samples, self.target_boxes, self.sample_weights,
-                self.previous_replace_ind, self.num_stored_samples, self.num_init_samples)
+        if 2 == self.frame_num:
+            self.log('frame={}'.format(self.frame_num))
+            self.log('')
+            self.log('att : {}'.format(tracklet_str(self.att)))
+            # find candidates based on att
+            candidate_tracklets = self.find_candidates_from_att(
+                2, backbone_feat, sample_x,
+                sample_poss, sample_scales)
+            # log
+            self.log('find candidates based on att')
+            for i, candidate_tracklet in enumerate(candidate_tracklets, 1):
+                self.log('CTs_{} : {}'.format(i, tracklet_str(candidate_tracklet)))
+            # ATs <- CTs
+            self.ActiveTracklets = candidate_tracklets
+            # log
+            self.log('ATs <- CTs')
+            for i, active_tracklet in enumerate(self.ActiveTracklets, 1):
+                self.log('ATs_{} : {}'.format(i, tracklet_str(active_tracklet)))
+            # Dynamic Programming
+            for active_tracklet in self.ActiveTracklets:
+                active_tracklet['dpscore'] = self.dpscore_tracklet(active_tracklet)
+            scorelist = [tracklet['dpscore'] for tracklet in self.ActiveTracklets]
+            scoremaxidx = np.argmax(scorelist)
+            self.att = self.ActiveTracklets[scoremaxidx]
+            # log
+            self.log('Dynamic Programming')
+            for i, active_tracklet in enumerate(self.ActiveTracklets, 1):
+                self.log('ATs_{} : {}'.format(i, tracklet_str(active_tracklet)))
+            self.log('att : {}'.format(tracklet_str(self.att)))
+            self.log('')
+            self.log.flush()
+        else:
+            self.log('frame={}'.format(self.frame_num))
+            self.log('')
+            self.log('att : {}'.format(tracklet_str(self.att)))
+            # update ATs
+            active_tracklets_tmp = []
+            for tracklet in self.ActiveTracklets:
+                tracklet, extended = self.extend_tracklet(
+                    self.frame_num, backbone_feat, sample_x,
+                    sample_poss, sample_scales, scoremap_att, tracklet)
+                if extended:
+                    active_tracklets_tmp.append(tracklet)
+                else:
+                    self.Tracklets.append(tracklet)
+            self.ActiveTracklets = active_tracklets_tmp
+            # log
+            self.log('update ATs')
+            for i, active_tracklet in enumerate(self.ActiveTracklets, 1):
+                self.log('ATs_{} : {}'.format(i, tracklet_str(active_tracklet)))
+            # examine every combination of ATs
+            for tracklet_i, tracklet_j in combinations(self.ActiveTracklets, 2):
+                if any([tracklet_i is tracklet for tracklet in active_tracklets_tmp]) and \
+                        any([tracklet_j is tracklet for tracklet in active_tracklets_tmp]):
+                    iou = self.iou_tracklets(tracklet_i, tracklet_j)
+                    if 0.5 <= iou:
+                        if tracklet_i['iou'][-1] < tracklet_j['iou'][-1]:
+                            tracklet = tracklet_i
+                        else:
+                            tracklet = tracklet_j
+                        tracklet['pos'] = tracklet['pos'][:-1]
+                        tracklet['target_sz'] = tracklet['target_sz'][:-1]
+                        tracklet['score'] = tracklet['score'][:-1]
+                        tracklet['iou'] = tracklet['iou'][:-1]
+                        active_tracklets_tmp.remove(tracklet)
+            self.ActiveTracklets = active_tracklets_tmp
+            # log
+            self.log('examine every combination of ATs')
+            for i, active_tracklet in enumerate(self.ActiveTracklets, 1):
+                self.log('ATs_{} : {}'.format(i, tracklet_str(active_tracklet)))
+            # find candidates based on att
+            candidate_tracklets = self.find_candidates_from_att(
+                self.frame_num, backbone_feat, sample_x,
+                sample_poss, sample_scales)
+            candidate_tracklets_tmp = []
+            for candidate_tracklet in candidate_tracklets:
+                maxiou = 0.0
+                for active_tracklet in self.ActiveTracklets:
+                    maxiou = max(maxiou, self.iou_tracklets(candidate_tracklet, active_tracklet))
+                if maxiou < 0.5:
+                    candidate_tracklets_tmp.append(candidate_tracklet)
+            candidate_tracklets = candidate_tracklets_tmp
+            # log
+            self.log('find candidates based on att')
+            for i, candidate_tracklet in enumerate(candidate_tracklets, 1):
+                self.log('CTs_{} : {}'.format(i, tracklet_str(candidate_tracklet)))
+            # ATs <- ATs + CTs
+            self.ActiveTracklets.extend(candidate_tracklets)
+            # log
+            self.log('ATs <- ATs + CTs')
+            for i, active_tracklet in enumerate(self.ActiveTracklets, 1):
+                self.log('ATs_{} : {}'.format(i, tracklet_str(active_tracklet)))
+            # Dynamic Programming
+            for active_tracklet in self.ActiveTracklets:
+                active_tracklet['dpscore'] = self.dpscore_tracklet(active_tracklet)
+            scorelist = [tracklet['dpscore'] for tracklet in self.ActiveTracklets]
+            scoremaxidx = np.argmax(scorelist)
+            self.att = self.ActiveTracklets[scoremaxidx]
+            # log
+            self.log('Dynamic Programming')
+            for i, active_tracklet in enumerate(self.ActiveTracklets, 1):
+                self.log('ATs_{} : {}'.format(i, tracklet_str(active_tracklet)))
+            self.log('att : {}'.format(tracklet_str(self.att)))
+            self.log('')
+            self.log.flush()
 
         # # update distractors
         # keepidx = []
@@ -290,40 +422,42 @@ class DiMP(BaseTracker):
 
         # ------- UPDATE ------- #
 
-        update_flag = flag not in ['not_found', 'uncertain']
-        hard_negative = (flag == 'hard_negative')
-        learning_rate = getattr(self.params, 'hard_negative_learning_rate', None) if hard_negative else None
-
-        if getattr(self.params, 'update_classifier', False) and update_flag:
-            # Get train sample
-            train_x = test_x[scale_ind:scale_ind+1, ...]
-            # Create target_box and label for spatial sample
-            target_box = self.get_iounet_box(
-                self.pos, self.target_sz, sample_pos[scale_ind, :], sample_scales[scale_ind])
-            # Update the classifier model
-            self.update_classifier(train_x, target_box, learning_rate, s[scale_ind, ...])
+        # update_flag = flag not in ['not_found', 'uncertain']
+        # hard_negative = (flag == 'hard_negative')
+        # learning_rate = getattr(self.params, 'hard_negative_learning_rate', None) if hard_negative else None
+        #
+        # if getattr(self.params, 'update_classifier', False) and update_flag:
+        #     # Get train sample
+        #     train_x = test_x[scale_ind:scale_ind+1, ...]
+        #     # Create target_box and label for spatial sample
+        #     target_box = self.get_iounet_box(
+        #         self.pos, self.target_sz, sample_pos[scale_ind, :], sample_scales[scale_ind])
+        #     # Update the classifier model
+        #     self.update_classifier(train_x, target_box, learning_rate, s[scale_ind, ...])
 
         # Set the pos of the tracker to iounet pos
-        if getattr(self.params, 'use_iou_net', True) and flag != 'not_found' and hasattr(self, 'pos_iounet'):
-            self.pos = self.pos_iounet.clone()
+        # if getattr(self.params, 'use_iou_net', True) and flag != 'not_found' and hasattr(self, 'pos_iounet'):
+        #     self.pos = self.pos_iounet.clone()
+        #
+        # score_map = s[scale_ind, ...]
+        # max_score = torch.max(score_map).item()
+        # self.debug_info['max_score'] = max_score
+        #
+        # if self.visdom is not None:
+        #     self.visdom.register(score_map, 'heatmap', 2, 'Score Map')
+        #     self.visdom.register(self.debug_info, 'info_dict', 1, 'Status')
+        # elif self.params.debug >= 2:
+        #     show_tensor(score_map, 5, title='Max score = {:.2f}'.format(max_score))
 
-        score_map = s[scale_ind, ...]
-        max_score = torch.max(score_map).item()
-        self.debug_info['max_score'] = max_score
-
-        if self.visdom is not None:
-            self.visdom.register(score_map, 'heatmap', 2, 'Score Map')
-            self.visdom.register(self.debug_info, 'info_dict', 1, 'Status')
-        elif self.params.debug >= 2:
-            show_tensor(score_map, 5, title='Max score = {:.2f}'.format(max_score))
-
-        new_state = torch.cat((self.pos[[1, 0]] - (self.target_sz[[1, 0]] - 1) / 2, self.target_sz[[1, 0]]))
-        candidates = []
-        for candidate in candidates_tracklets:
-            pos_c, target_sz_c = candidate['pos'], candidate['target_sz']
-            state_c = torch.cat((pos_c[[1, 0]] - (target_sz_c[[1, 0]] - 1) / 2, target_sz_c[[1, 0]]))
-            candidates.append(state_c.tolist())
-        out = {'target_bbox': new_state.tolist(), 'candidates': candidates}
+        att = torch.cat(
+            (self.att['pos'][-1][[1, 0]] - (self.att['target_sz'][-1][[1, 0]] - 1) / 2,
+             self.att['target_sz'][-1][[1, 0]]))
+        ats = []
+        for active_tracklet in self.ActiveTracklets:
+            pos, target_sz = active_tracklet['pos'][-1], active_tracklet['target_sz'][-1]
+            state = torch.cat((pos[[1, 0]] - (target_sz[[1, 0]] - 1) / 2, target_sz[[1, 0]]))
+            ats.append(state.tolist())
+        out = {'att': att.tolist(), 'ats': ats}
         # Compute output bounding box
         # new_state = torch.cat((self.pos[[1, 0]] - (self.target_sz[[1, 0]] - 1) / 2, self.target_sz[[1, 0]]))
         # distractors = []
@@ -648,11 +782,13 @@ class DiMP(BaseTracker):
             p.requires_grad = False
 
         # Get target boxes for the different augmentations
-        self.classifier_target_box = self.get_iounet_box(self.pos, self.target_sz, self.init_sample_pos, self.init_sample_scale)
+        self.classifier_target_box = self.get_iounet_box(
+            self.pos, self.target_sz, self.init_sample_pos, self.init_sample_scale)
         target_boxes = TensorList()
         if self.params.iounet_augmentation:
             for T in self.transforms:
-                if not isinstance(T, (augmentation.Identity, augmentation.Translation, augmentation.FlipHorizontal, augmentation.FlipVertical, augmentation.Blur)):
+                if not isinstance(T, (augmentation.Identity, augmentation.Translation,
+                                      augmentation.FlipHorizontal, augmentation.FlipVertical, augmentation.Blur)):
                     break
                 target_boxes.append(self.classifier_target_box + torch.Tensor([T.shift[1], T.shift[0], 0, 0]))
         else:
@@ -883,9 +1019,10 @@ class DiMP(BaseTracker):
 
         # Remove weird boxes
         output_boxes[:, 2:].clamp_(1)
-        aspect_ratio = output_boxes[:,2] / output_boxes[:,3]
-        keep_ind = (aspect_ratio < self.params.maximal_aspect_ratio) * (aspect_ratio > 1/self.params.maximal_aspect_ratio)
-        output_boxes = output_boxes[keep_ind,:]
+        aspect_ratio = output_boxes[:, 2] / output_boxes[:, 3]
+        keep_ind = (aspect_ratio < self.params.maximal_aspect_ratio) \
+            * (aspect_ratio > 1/self.params.maximal_aspect_ratio)
+        output_boxes = output_boxes[keep_ind, :]
         output_iou = output_iou[keep_ind]
 
         # If no box found
@@ -897,13 +1034,13 @@ class DiMP(BaseTracker):
         topk = min(k, output_boxes.shape[0])
         _, inds = torch.topk(output_iou, topk)
         predicted_box = output_boxes[inds, :].mean(0)
-        predicted_iou = output_iou.view(-1, 1)[inds, :].mean(0)
+        # predicted_iou = output_iou.view(-1, 1)[inds, :].mean(0)
 
         # Get new position and size
         new_pos = predicted_box[:2] + predicted_box[2:] / 2
         new_pos = (new_pos.flip((0,)) - (self.img_sample_sz - 1) / 2) * sample_scale + sample_pos
         new_target_sz = predicted_box[2:].flip((0,)) * sample_scale
-        new_scale = torch.sqrt(new_target_sz.prod() / self.base_target_sz.prod())
+        # new_scale = torch.sqrt(new_target_sz.prod() / self.base_target_sz.prod())
 
         return new_pos, new_target_sz
 
@@ -912,7 +1049,9 @@ class DiMP(BaseTracker):
         output_boxes = init_boxes.view(1, -1, 4).to(self.params.device)
         step_length = self.params.box_refinement_step_length
         if isinstance(step_length, (tuple, list)):
-            step_length = torch.Tensor([step_length[0], step_length[0], step_length[1], step_length[1]], device=self.params.device).view(1,1,4)
+            step_length = torch.Tensor(
+                [step_length[0], step_length[0], step_length[1], step_length[1]],
+                device=self.params.device).view(1, 1, 4)
 
         outputs = None
         for i_ in range(self.params.box_refinement_iter):
@@ -925,7 +1064,7 @@ class DiMP(BaseTracker):
             if isinstance(outputs, (list, tuple)):
                 outputs = outputs[0]
 
-            outputs.backward(gradient = torch.ones_like(outputs))
+            outputs.backward(gradient=torch.ones_like(outputs))
 
             # Update proposal
             output_boxes = bb_init + step_length * bb_init.grad * bb_init[:, :, 2:].repeat(1, 1, 2)
@@ -935,19 +1074,25 @@ class DiMP(BaseTracker):
 
         return output_boxes.view(-1, 4).cpu(), outputs.detach().view(-1).cpu()
 
-    def find_candidates(
-            self, frame_num, backbone_feat, target_filter, sample_x,
-            sample_poss, sample_scales, target_sz,
-            training_samples, target_boxes, sample_weights,
-            previous_replace_ind, num_stored_samples, num_init_samples):
-        candidates_tracklets = []
+    def find_candidates_from_att(
+            self, frame_num, backbone_feat, sample_x,
+            sample_poss, sample_scales):
+        target_filter = self.att['target_filter']
+        target_sz = self.att['target_sz'][-1]
+        training_samples = self.att['training_samples']
+        target_boxes = self.att['target_boxes']
+        sample_weights = self.att['sample_weights']
+        previous_replace_ind = self.att['previous_replace_ind']
+        num_stored_samples = self.att['num_stored_samples']
+        num_init_samples = self.att['num_init_samples']
+        candidate_tracklets = []
         inside_ratio = getattr(self.params, 'target_inside_ratio', 0.2)
         inside_offset = (inside_ratio - 0.5) * target_sz
         scoremap = self.classify_target(target_filter, sample_x)
         while True:
             translation_vec, scale_ind, s, flag, scoremax, dispmax =\
                 self.localize_target(scoremap, sample_scales, advanced=False)
-            if 0.1 <= scoremax:
+            if 0.1 <= scoremax or (len(self.ActiveTracklets) == 0 and len(candidate_tracklets) == 0):
                 pos = sample_poss[scale_ind, :] + translation_vec
                 pos = torch.max(torch.min(pos, self.image_sz - inside_offset), inside_offset)
                 pos, target_sz = self.refine_target_box_individually(
@@ -959,8 +1104,8 @@ class DiMP(BaseTracker):
                 maxiou = 0.0
                 for tracklet in self.ActiveTracklets:
                     rect_i = Rectangle(
-                        float(tracklet['pos'][0]), float(tracklet['pos'][1]),
-                        float(tracklet['target_sz'][0]), float(tracklet['target_sz'][1]), 'cy_cx_h_w')
+                        float(tracklet['pos'][-1][0]), float(tracklet['pos'][-1][1]),
+                        float(tracklet['target_sz'][-1][0]), float(tracklet['target_sz'][-1][1]), 'cy_cx_h_w')
                     iou = Rectangle.iou(rect_t, rect_i)
                     maxiou = max(maxiou, iou)
                 if maxiou < 0.2:
@@ -980,19 +1125,22 @@ class DiMP(BaseTracker):
                             train_x, target_box, target_filter,
                             training_samples, target_boxes, sample_weights,
                             previous_replace_ind, num_stored_samples, num_init_samples)
-                    candidates_tracklets.append({
-                        'start': frame_num,
-                        'end': frame_num + 1,
-                        'pos': pos,
-                        'target_sz': target_sz,
-                        'score': scoremax,
+                    candidate_tracklet = {
+                        'start_frame': frame_num,
+                        'end_frame': frame_num + 1,
+                        'pos': [pos],
+                        'target_sz': [target_sz],
+                        'score': [scoremax],
+                        'iou': [1.0],
+                        'dpscore': -math.inf,
                         'target_filter': target_filter,
                         'training_samples': training_samples,
                         'target_boxes': target_boxes,
                         'sample_weights': sample_weights,
                         'previous_replace_ind': previous_replace_ind,
                         'num_stored_samples': num_stored_samples,
-                        'num_init_samples': num_init_samples})
+                        'num_init_samples': num_init_samples}
+                    candidate_tracklets.append(candidate_tracklet)
                 sz = scoremap.shape[-2:]
                 d = 1
                 tneigh_top = max(round(dispmax[0].item() - d), 0)
@@ -1002,4 +1150,81 @@ class DiMP(BaseTracker):
                 scoremap[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
             else:
                 break
-        return candidates_tracklets
+        return candidate_tracklets
+
+    def dpscore_tracklet(self, tracklet):
+        score_unary = sum(tracklet['score'])
+        maxscore = -math.inf
+        bbox_i = np.array(bbox(
+            tracklet['pos'][0], tracklet['target_sz'][0], self.imgw, self.imgh))
+        for tracklet_i in self.Tracklets:
+            if tracklet['start_frame'] < tracklet_i['end_frame']:
+                continue
+            bbox_j = np.array(bbox(
+                tracklet_i['pos'][-1], tracklet_i['target_sz'][-1], self.imgw, self.imgh))
+            score = score_unary + tracklet_i['dpscore'] - self.wloc * np.sum(np.abs(bbox_i - bbox_j))
+            maxscore = max(maxscore, score)
+        return maxscore
+
+    def extend_tracklet(
+            self, frame_num, backbone_feat,
+            sample_x, sample_poss, sample_scales,
+            scoremap_att, tracklet):
+        target_filter = tracklet['target_filter']
+        pos_1 = tracklet['pos'][-1]
+        target_sz_1 = tracklet['target_sz'][-1]
+        inside_ratio = getattr(self.params, 'target_inside_ratio', 0.2)
+        inside_offset = (inside_ratio - 0.5) * target_sz_1
+        scoremap = self.classify_target(target_filter, sample_x)
+        extended = False
+        while True:
+            translation_vec, scale_ind, s, flag, scoremax, dispmax =\
+                self.localize_target(scoremap, sample_scales, advanced=False)
+            if 0.1 <= scoremax:
+                pos_2 = sample_poss[scale_ind, :] + translation_vec
+                pos_2 = torch.max(torch.min(pos_2, self.image_sz - inside_offset), inside_offset)
+                pos_2, target_sz_2 = self.refine_target_box_individually(
+                    backbone_feat, pos_2, target_sz_1,
+                    sample_poss[scale_ind, :], sample_scales[scale_ind], scale_ind)
+                rect_1 = Rectangle(pos_1[0], pos_1[1], target_sz_1[0], target_sz_1[1], 'cy_cx_h_w')
+                rect_2 = Rectangle(pos_2[0], pos_2[1], target_sz_2[0], target_sz_2[1], 'cy_cx_h_w')
+                iou = Rectangle.iou(rect_1, rect_2)
+                if 0.5 <= iou:
+                    extended = True
+                    train_x = sample_x[scale_ind:scale_ind + 1, ...]
+                    target_box = self.get_iounet_box(
+                        pos_2, target_sz_2, sample_poss[scale_ind, :], sample_scales[scale_ind])
+                    tracklet['target_filter'], tracklet['training_samples'], tracklet['target_boxes'], \
+                        tracklet['sample_weights'], tracklet['previous_replace_ind'], \
+                        tracklet['num_stored_samples'], tracklet['num_init_samples'] \
+                        = self.update_classifier_individually(
+                            train_x, target_box, tracklet['target_filter'],
+                            tracklet['training_samples'], tracklet['target_boxes'],
+                            tracklet['sample_weights'], tracklet['previous_replace_ind'],
+                            tracklet['num_stored_samples'], tracklet['num_init_samples'])
+                    score_att = scoremap_att[..., int(dispmax[0]), int(dispmax[1])]
+                    tracklet['end_frame'] = frame_num + 1
+                    tracklet['pos'].append(pos_2)
+                    tracklet['target_sz'].append(target_sz_2)
+                    tracklet['score'].append(score_att)
+                    tracklet['iou'].append(iou)
+                    break
+                sz = scoremap.shape[-2:]
+                d = 1
+                tneigh_top = max(round(dispmax[0].item() - d), 0)
+                tneigh_bottom = min(round(dispmax[0].item() + d + 1), sz[0])
+                tneigh_left = max(round(dispmax[1].item() - d), 0)
+                tneigh_right = min(round(dispmax[1].item() + d + 1), sz[1])
+                scoremap[..., tneigh_top:tneigh_bottom, tneigh_left:tneigh_right] = 0
+            else:
+                break
+        return tracklet, extended
+
+    def iou_tracklets(self, tracklet_i, tracklet_j):
+        rect_i = Rectangle(
+            tracklet_i['pos'][-1][0], tracklet_i['pos'][-1][1],
+            tracklet_i['target_sz'][-1][0], tracklet_i['target_sz'][-1][1], 'cy_cx_h_w')
+        rect_j = Rectangle(
+            tracklet_j['pos'][-1][0], tracklet_j['pos'][-1][1],
+            tracklet_j['target_sz'][-1][0], tracklet_j['target_sz'][-1][1], 'cy_cx_h_w')
+        return Rectangle.iou(rect_i, rect_j)
